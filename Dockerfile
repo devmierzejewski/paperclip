@@ -179,6 +179,70 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
 
+# .NET SDKs and PowerShell, for agents working in .NET repositories: a repo whose
+# entry point declares `dotnet build` / `dotnet test`, or whose tooling ships
+# PowerShell scripts, is otherwise unbuildable here and an agent can only report
+# BLOCKED:tooling. Placed in its own layer for the same reason as the tool layer
+# above — it references nothing from /app, so it survives the app copy's cache
+# bust. Both SDKs live side by side; which one a repo uses is decided by its
+# global.json, or the newest installed when a repo pins none.
+#
+# Pin DOTNET_CHANNELS and PWSH_VERSION to make a build reproducible. Left as is,
+# PWSH_VERSION resolves to the current PowerShell release at build time, matching
+# how the layer above tracks @latest for the CLI toolchains.
+ARG TARGETARCH
+ARG DOTNET_CHANNELS="8.0 10.0"
+ARG PWSH_VERSION=""
+ENV DOTNET_ROOT=/usr/share/dotnet \
+    DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+    DOTNET_NOLOGO=1 \
+    PATH="/usr/share/dotnet:${PATH}"
+RUN apt-get update \
+  # Trixie renamed libssl for the 64-bit time_t transition; accept either name
+  # rather than pinning to one a base-image bump could drop.
+  && (apt-get install -y --no-install-recommends libssl3t64 \
+      || apt-get install -y --no-install-recommends libssl3) \
+  # libicu-dev rather than a numbered libicuNN: it pulls whatever runtime the
+  # distro ships, so a base-image bump does not break this layer. .NET needs ICU
+  # unless it runs in invariant-globalization mode, which silently changes
+  # culture-sensitive behaviour — not something to impose on a build host.
+  && apt-get install -y --no-install-recommends libicu-dev libgssapi-krb5-2 libstdc++6 zlib1g \
+  && rm -rf /var/lib/apt/lists/* \
+  && curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh \
+  && chmod +x /tmp/dotnet-install.sh \
+  && for channel in ${DOTNET_CHANNELS}; do \
+       /tmp/dotnet-install.sh --channel "$channel" --install-dir "$DOTNET_ROOT" --no-path; \
+     done \
+  && rm /tmp/dotnet-install.sh \
+  && ln -sf "$DOTNET_ROOT/dotnet" /usr/local/bin/dotnet \
+  && case "${TARGETARCH:-amd64}" in \
+       amd64) pwsh_arch=x64 ;; \
+       arm64) pwsh_arch=arm64 ;; \
+       *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+     esac \
+  && pwsh_version="${PWSH_VERSION}" \
+  && if [ -z "$pwsh_version" ]; then \
+       pwsh_version="$(curl -fsSL https://api.github.com/repos/PowerShell/PowerShell/releases/latest \
+         | jq -r .tag_name | sed 's/^v//')"; \
+     fi \
+  && test -n "$pwsh_version" \
+  && curl -fsSL "https://github.com/PowerShell/PowerShell/releases/download/v${pwsh_version}/powershell-${pwsh_version}-linux-${pwsh_arch}.tar.gz" \
+       -o /tmp/pwsh.tar.gz \
+  && mkdir -p /opt/microsoft/powershell/7 \
+  && tar -xzf /tmp/pwsh.tar.gz -C /opt/microsoft/powershell/7 \
+  && rm /tmp/pwsh.tar.gz \
+  && chmod +x /opt/microsoft/powershell/7/pwsh \
+  && ln -sf /opt/microsoft/powershell/7/pwsh /usr/local/bin/pwsh \
+  # No NuGet/dotnet state is seeded here: node's home is /paperclip, which a
+  # deployment mounts as a volume, so anything written there at build time is
+  # masked at run time. The CLI creates its own ~/.nuget and ~/.dotnet on first
+  # use, and the volume is already node-owned.
+  #
+  # Fail the build here rather than leave an agent to find a broken toolchain
+  # at run time.
+  && dotnet --list-sdks \
+  && pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
